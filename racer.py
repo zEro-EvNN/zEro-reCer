@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # zEro raCer :: by EvNN / saMan
-# v5.2 -- strict RFC compliance and final debug pass.
+# v5.3 -- bounded decoding and stricter HTTP response framing.
 #
 # fixes:
 #  - RFC 7230: TE overrides CL (prevents HTTP request smuggling parsing bugs)
@@ -46,7 +46,7 @@ try:
 except Exception:
     _HAS_BR = False
 
-__version__ = "5.2"
+__version__ = "5.3"
 
 X = "\033[0m"
 R = "\033[91m"
@@ -301,60 +301,64 @@ def _via_proxy(a, host, port):
     return s
 
 def _decode_body(data, hdrs, max_body):
+    """Decode supported content encodings without allowing unbounded output."""
     ce = (hdrs.get("content-encoding") or "").lower().strip()
     if not ce or ce == "identity":
         return data[:max_body], len(data) <= max_body
 
     encodings = [e.strip() for e in ce.split(",") if e.strip()]
-    truncated = False
+    if not encodings:
+        return data[:max_body], len(data) <= max_body
+
+    # brotli's common Python API has no output-size limit. Do not call process()
+    # on untrusted compressed bytes because a tiny response can expand massively.
+    if any(enc == "br" for enc in encodings):
+        return data[:max_body], False
 
     for enc in reversed(encodings):
-        decomp = None
         if enc == "gzip":
-            decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            wbits = 16 + zlib.MAX_WBITS
         elif enc == "deflate":
-            decomp = zlib.decompressobj()
-        elif enc == "br" and _HAS_BR:
-            decomp = brotli.Decompressor()
+            wbits = zlib.MAX_WBITS
         else:
             return data[:max_body], False
 
-        out = bytearray()
-        chunk_size = 4096
-        for i in range(0, len(data), chunk_size):
-            chunk = data[i:i+chunk_size]
-            try:
-                if enc == "br":
-                    out.extend(decomp.process(chunk))
-                else:
-                    out.extend(decomp.decompress(chunk))
-            except Exception:
-                return bytes(out[:max_body]), False
-            
-            if len(out) > max_body:
-                truncated = True
-                break
-        
-        if truncated:
-            break
-            
-        if not truncated:
-            try:
-                if enc == "br":
-                    if not decomp.is_finished():
+        try:
+            dec = zlib.decompressobj(wbits)
+            out = bytearray()
+            pos = 0
+            truncated = False
+            chunk_size = 1024
+            while pos < len(data):
+                pending = data[pos:pos + chunk_size]
+                pos += len(pending)
+                while pending:
+                    # Ask for one byte beyond the limit so overflow is detected,
+                    # but never retain more than max_body + 1 bytes.
+                    limit = max(1, max_body + 1 - len(out))
+                    piece = dec.decompress(pending, limit)
+                    out.extend(piece)
+                    if len(out) > max_body:
                         truncated = True
-                else:
-                    out.extend(decomp.flush())
-                    if not decomp.eof:
+                        break
+                    next_pending = dec.unconsumed_tail
+                    if next_pending == pending and not piece:
                         truncated = True
-            except Exception:
-                truncated = True
-                
-        data = bytes(out[:max_body])
-        if truncated:
-            break
+                        break
+                    pending = next_pending
+                if truncated:
+                    break
 
-    return data, not truncated
+            if not truncated and not dec.eof:
+                # A response ending before the compression stream does is partial.
+                truncated = True
+            data = bytes(out[:max_body])
+            if truncated:
+                return data, False
+        except Exception:
+            return bytes(out[:max_body]) if 'out' in locals() else b"", False
+
+    return data[:max_body], True
 
 INTERESTING = ("balance", "uses_left", "remaining", "count", "success",
                "message", "error", "uses", "quota", "stock", "available")
@@ -504,19 +508,30 @@ def _h1_read(s, timeout, t0, max_body, method):
                 if len(buf) > MAX_HEADERS: break
                 continue
             head_end = pos + 4
+            malformed_headers = False
             for ln in buf[:pos].split(b"\r\n")[1:]:
+                if not ln or b":" not in ln:
+                    malformed_headers = True
+                    break
                 k, _, v = ln.partition(b":")
+                if not k.strip() or any(ch <= 32 or ch >= 127 for ch in k.strip()):
+                    malformed_headers = True
+                    break
                 kl = k.strip().lower().decode("latin-1", "replace")
-                # RFC 7230: multiple headers with the same name should be combined
+                # Preserve duplicates so framing headers can be validated below.
+                value = v.strip().decode("latin-1", "replace")
                 if kl in hdrs:
-                    hdrs[kl] += ", " + v.strip().decode("latin-1", "replace")
+                    hdrs[kl] += ", " + value
                 else:
-                    hdrs[kl] = v.strip().decode("latin-1", "replace")
-            
+                    hdrs[kl] = value
+
             parts = buf[:pos].split(b" ")
             if len(parts) >= 2 and parts[1].isdigit():
                 code = int(parts[1])
-            
+
+            if malformed_headers or code == 0:
+                return time.perf_counter() - t0, code, "", False, True
+
             if 100 <= code < 200:
                 if code == 101:
                     return time.perf_counter() - t0, code, "", False, True
@@ -528,15 +543,23 @@ def _h1_read(s, timeout, t0, max_body, method):
             if method == "HEAD" or code in (204, 304):
                 return time.perf_counter() - t0, code, "", True, ("close" in hdrs.get("connection", "").lower())
 
-            # RFC 7230: TE overrides CL
-            if "chunked" in hdrs.get("transfer-encoding", "").lower():
+            # Transfer-Encoding takes precedence over Content-Length. Only accept
+            # a supported final chunked coding; ambiguous framing is rejected.
+            if "transfer-encoding" in hdrs:
+                te = [x.strip().lower() for x in hdrs["transfer-encoding"].split(",") if x.strip()]
+                if te != ["chunked"]:
+                    return time.perf_counter() - t0, code, "", False, True
                 chunked = True
                 cl = None
             elif "content-length" in hdrs:
-                try: 
-                    cl = int(hdrs["content-length"])
-                    if cl < 0: cl = None
-                except Exception: pass
+                raw_cls = [x.strip() for x in hdrs["content-length"].split(",")]
+                try:
+                    cls = [int(x, 10) for x in raw_cls]
+                    if not cls or any(x < 0 for x in cls) or len(set(cls)) != 1:
+                        return time.perf_counter() - t0, code, "", False, True
+                    cl = cls[0]
+                except (ValueError, TypeError):
+                    return time.perf_counter() - t0, code, "", False, True
 
             if "close" in hdrs.get("connection", "").lower(): conn_close = True
 
